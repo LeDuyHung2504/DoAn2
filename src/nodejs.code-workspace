@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "../../../nodejs"
+		},
+		{
+			"name": "IoT_tuThongMinh1",
+			"path": "../../../IoT_tuThongMing(1)/IoT_tuThongMinh1"
+		},
+		{
+			"name": "IoT_tuDoThongMinh",
+			"path": ".."
+		}
+	],
+	"settings": {}
+}

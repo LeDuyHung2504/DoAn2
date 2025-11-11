@@ -1,0 +1,410 @@
+// #include <Arduino.h>
+// #include <SPI.h>
+// #include <MFRC522.h>
+// #include <WiFi.h>
+
+// #include <HTTPClient.h>
+// #include <WiFiClientSecure.h>
+
+// // =================== CẤU HÌNH ===================
+// // Thong tin WiFi
+// const char* ssid = "Tenda_3A7FD8";       // Ten WiFi
+// const char* password = "12312345@";   // Mat khau WiFi
+
+// // ID cua Google Script da deploy
+// const char* GScriptId = "AKfycbxm-3qG1tqFKv0Rlsb07zqPaj__ZBcD-MEFJ7tPNqMXPCWqPZuoLg1rnIjr2RpZDJ2o"; // << THAY ID SCRIPT CỦA BẠN VÀO ĐÂY
+
+// // --- PIN Definitions ---
+// #define ledXanh 12           // LED xanh, báo tủ trống (không có đồ)
+// #define ledDo 13              // LED đỏ, báo tủ đang được dùng (có đồ)
+// #define khoaDien 26           // Chân điều khiển khóa điện từ
+// #define trig 14               // Chân Trig của cảm biến siêu âm
+// #define echo 27               // Chân Echo của cảm biến siêu âm
+// #define congTacHanhTrinh 15   // Chân nối với công tắc hành trình
+// #define SS_PIN 16             // Chân SS/SDA của module RFID
+// #define RST_PIN 17            // Chân RST của module RFID
+
+// // =================== CÁC ĐỐI TƯỢNG TOÀN CỤC ===================
+// MFRC522 rfid(SS_PIN, RST_PIN);
+// String url = "https://script.google.com/macros/s/" + String(GScriptId) + "/exec";
+// const char* host = "script.google.com";
+// const int httpsPort = 443;
+
+// // --- Cấu trúc dữ liệu để giao tiếp giữa các Task ---
+// struct UploadData_t {
+//   bool coDo;              // Trạng thái tủ có đồ hay không
+//   char uid[20];           // UID của thẻ RFID, nếu có
+// };
+
+// // --- RTOS Handle cho Queue ---
+// QueueHandle_t uploadQueue;
+
+// // =================== CÁC TÁC VỤ (TASKS) ===================
+
+// /**
+//  * @brief TASK 1: LIÊN TỤC KIỂM TRA TỦ CÓ ĐỒ HAY KHÔNG
+//  * - Đo khoảng cách bằng cảm biến siêu âm.
+//  * - Nếu có đồ, bật đèn đỏ và gửi trạng thái vào Queue.
+//  */
+// void kiemTraTuTask(void *pvParameters) {
+//   pinMode(trig, OUTPUT);
+//   pinMode(echo, INPUT);
+//   pinMode(ledDo, OUTPUT);
+
+//   for (;;) {
+//     // Phat song xung sieu am
+//     digitalWrite(trig, LOW);
+//     delayMicroseconds(2);
+//     digitalWrite(trig, HIGH);
+//     delayMicroseconds(10);
+//     digitalWrite(trig, LOW);
+
+//     // Doc thoi gian phan hoi va tinh khoang cach
+//     long duration = pulseIn(echo, HIGH, 25000); // Thêm timeout để tránh bị treo
+//     int distance = duration * 0.034 / 2;
+
+//     if (distance > 0 && distance < 18) { // Neu co vat the trong vung 18cm
+//       digitalWrite(ledDo, HIGH); // Bật đèn đỏ báo hiệu tủ đang được dùng
+
+//       // Chuẩn bị dữ liệu để gửi vào Queue
+//       UploadData_t duLieu;
+//       duLieu.coDo = true;
+//       // strcpy(duLieu.uid, "N/A"); // được gủi bởi Task 2 nếu có thẻ RFID
+
+//       // Gửi vào Queue, 0 nghĩa là không chờ nếu Queue đầy (ghi đè nếu cần)
+//       xQueueSend(uploadQueue, &duLieu, 0);
+
+//     } else {
+//       digitalWrite(ledDo, LOW); // Tắt đèn đỏ
+//     }
+
+//     // Chờ 1 giây rồi kiểm tra lại
+//     vTaskDelay(1000 / portTICK_PERIOD_MS);
+//   }
+// }
+
+// /**
+//  * @brief TASK 2: QUẢN LÝ CỬA VÀ RFID
+//  * - Đọc công tắc hành trình để biết cửa đóng hay mở.
+//  * - Nếu cửa đóng, cho phép quét thẻ RFID để mở khóa.
+//  * - Sau khi người dùng gửi đồ xong, gửi UID vào Queue.
+//  */
+
+// // công tắc hành trình	rfid
+// // 0                  	0		    cửa mở, chờ dùng dùng đóng cửa (trường hợp lấy đồ)
+// // 0                  	1		    cửa mở, chờ dùng dùng đóng cửa lưu ID (trường hợp gửi đồ
+// // 1                   	0		    cửa đóng chờ người dùng quét thẻ
+// // 1                  	1		    cửa đóng, chờ người dùng quét thẻ, đúng ID -> mở
+
+// // công tắc hành trình: 1 đóng ->  cửa đóng
+// // công tắc hành trình: 0 mở ->  cửa mở
+
+// // rfid: 1 phát hiện thẻ, 0 không phát hiện thẻ
+
+// void quanLyCuaVaRFIDTask(void *pvParameters) {
+//   pinMode(khoaDien, OUTPUT);
+//   pinMode(congTacHanhTrinh, INPUT_PULLDOWN); // Dùng điện trở kéo lên nội bộ
+
+//   static String IdNguoiGuiTruoc = ""; // Biến tĩnh để lưu ID người gửi trước đó
+
+//   digitalWrite(khoaDien, LOW); // Mặc định khóa tủ khi khởi động
+
+//   for (;;) {
+//     int trangThaiCua = digitalRead(congTacHanhTrinh);
+
+//     if (trangThaiCua == HIGH) { // Mức 1 -> Cửa đang đóng
+//       // 0 chờ người gửi đồ - Liên tục kiểm tra thẻ RFID
+//       if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial() && (IdNguoiGuiTruoc == "")) {
+
+//         // --- Mở khóa tủ ---
+//         Serial.println("Da quet the, mo khoa...");
+//         digitalWrite(khoaDien, HIGH); // Mở khóa
+
+//         // --- Chờ cho đến khi người dùng mở cửa ra ---
+//         while(digitalRead(congTacHanhTrinh) == HIGH) {
+//           vTaskDelay(50 / portTICK_PERIOD_MS); // Chờ 50ms
+//         }
+//         Serial.println("Phat hien nguoi dung da mo cua.");
+//         // --- người dũng đã mở cửa - trường hợp 01
+//         // --- nhả khóa điện ---
+//         digitalWrite(khoaDien, LOW);
+
+//         // --- Chờ cho đến khi người dùng đóng cửa lại ---
+//         Serial.println("Dang cho nguoi dung dong cua...");
+//         while(digitalRead(congTacHanhTrinh) == LOW) {
+//           vTaskDelay(50 / portTICK_PERIOD_MS);
+//         }
+//         Serial.println("Phat hien nguoi dung da dong cua. Hoan thanh.");
+
+//         // --- Gửi UID lên Queue sau khi hoàn tất ---
+//         String uidStr = "";
+//         for (byte i = 0; i < rfid.uid.size; i++) {
+//           uidStr += String(rfid.uid.uidByte[i], HEX);
+//         }
+//         uidStr.toUpperCase();
+
+//         IdNguoiGuiTruoc = uidStr; // Biến tĩnh để lưu ID người gửi trước đó
+
+//         UploadData_t duLieu;
+//         //duLieu.coDo = true; // có đồ hay không được quyết định bởi Task 1 - cám biến siêu âm
+//         uidStr.toCharArray(duLieu.uid, sizeof(duLieu.uid));
+
+//         xQueueSend(uploadQueue, &duLieu, 0);
+
+//         rfid.PICC_HaltA();
+//         rfid.PCD_StopCrypto1();
+//       }
+
+//     // truong hop nguoi dung lay do ra 11
+//     if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial() && (IdNguoiGuiTruoc != "")) {
+//       if (String(rfid.uid.uidByte[0], HEX).toUpperCase() + String(rfid.uid.uidByte[1], HEX).toUpperCase() +
+//           String(rfid.uid.uidByte[2], HEX).toUpperCase() + String(rfid.uid.uidByte[3], HEX).toUpperCase() == IdNguoiGuiTruoc) {
+//         Serial.println("The RFID hop le. Mo khoa de lay do...");
+//       } else {
+//         Serial.println("The RFID khong hop le. Tu choi mo khoa.");
+//         // Dừng xử lý thẻ không hợp lệ
+//         rfid.PICC_HaltA();
+//         rfid.PCD_StopCrypto1();
+//         vTaskDelay(1000 / portTICK_PERIOD_MS); // Chờ 1 giây trước khi tiếp tục
+//         continue; // Quay lại đầu vòng lặp
+//       }
+//       // Cửa đóng và có ID người gửi trước đó
+//       // Chờ cho đến khi cửa mở ra
+//       Serial.println("Dang cho nguoi dung mo cua de lay do...");
+//       while(digitalRead(congTacHanhTrinh) == HIGH) {
+//         vTaskDelay(50 / portTICK_PERIOD_MS); // Chờ 50ms
+//       }
+//       Serial.println("Phat hien nguoi dung da mo cua de lay do.");
+
+//       // --- người dùng đã mở cửa để lấy đồ - trường hợp 02
+//       // --- nhả khóa điện ---
+//       digitalWrite(khoaDien, LOW);
+
+//       // --- Chờ cho đến khi người dùng đóng cửa lại ---
+//       Serial.println("Dang cho nguoi dung dong cua sau khi lay do...");
+//       while(digitalRead(congTacHanhTrinh) == LOW) {
+//         vTaskDelay(50 / portTICK_PERIOD_MS);
+//       }
+//       Serial.println("Phat hien nguoi dung da dong cua. Hoan thanh.");
+
+//       // Xóa ID người gửi trước đó sau khi hoàn tất
+//       IdNguoiGuiTruoc = "";
+//     }
+
+//     } else { // Mức 0 -> Cửa đang mở, không làm gì cả
+//         // Đảm bảo khóa luôn tắt điện khi cửa mở
+//         digitalWrite(khoaDien, LOW);
+//     }
+
+//     {
+//     // Chờ một chút để không chiếm hết CPU
+//     vTaskDelay(100 / portTICK_PERIOD_MS);
+//   }
+// }
+
+// // /**
+// //  * @brief TASK 3: GỬI DỮ LIỆU LÊN GOOGLE SHEETS
+// //  * - Mỗi 5 giây, kiểm tra Queue.
+// //  * - Lấy dữ liệu mới nhất từ Queue và gửi lên Google Sheets.
+// //  */
+// // void guiDataLenSheetTask(void *pvParameters) {
+// //   bool trangThaiTuMoiNhat = false;
+// //   String uidMoiNhat = "N/A";
+
+// //   for (;;) {
+// //     vTaskDelay(5000 / portTICK_PERIOD_MS);
+
+// //     UploadData_t duLieuNhanDuoc;
+// //     while (xQueueReceive(uploadQueue, &duLieuNhanDuoc, 0) == pdTRUE) {
+// //       trangThaiTuMoiNhat = duLieuNhanDuoc.coDo;
+// //       if (String(duLieuNhanDuoc.uid) != "N/A") {
+// //         uidMoiNhat = String(duLieuNhanDuoc.uid);
+// //       }
+// //     }
+
+// //     if (WiFi.status() == WL_CONNECTED) {
+// //       Serial.printf("Bo nho Heap con trong truoc khi gui: %u bytes\n", ESP.getFreeHeap());
+// //       // SỬA ĐỔI: Áp dụng chu trình "Tạo - Dùng - Hủy"
+// //       // 1. TẠO đối tượng client mới cho mỗi lần gửi
+// //       client = new HTTPSRedirect(httpsPort);
+// //       client->setInsecure();
+// //       client->setPrintResponseBody(true);
+// //       client->setContentTypeHeader("application/json");
+
+// //       Serial.println("Tao ket noi moi den Google Scripts...");
+// //       if (client->connect(host, httpsPort)) {
+
+// //         String payload = "{\"command\": \"insert_row\", \"sheet_name\": \"Sheet1\", \"values\": \""
+// //                          + String(trangThaiTuMoiNhat ? "Co do" : "Trong") + ","
+// //                          + uidMoiNhat + "\"}";
+
+// //         Serial.println("--- Dang gui du lieu len Google Sheets ---");
+// //         Serial.println(payload);
+
+// //         // 2. DÙNG đối tượng client để gửi dữ liệu
+// //         if (client->POST(url, host, payload)) {
+// //           Serial.println("Gui thanh cong.");
+// //         } else {
+// //           Serial.println("Gui that bai.");
+// //         }
+// //       } else {
+// //         Serial.println("Ket noi den host that bai.");
+// //       }
+
+// //       // 3. HỦY đối tượng client để giải phóng bộ nhớ
+// //       delete client;
+// //       client = nullptr; // Quan trọng: Đặt lại con trỏ để tránh lỗi
+
+// //       uidMoiNhat = "N/A";
+
+// //     } else {
+// //       Serial.println("Loi: Mat ket noi WiFi, khong the gui du lieu.");
+// //     }
+// //   }
+// // }
+
+// /**
+//  * @brief TASK 3: GỬI DỮ LIỆU LÊN GOOGLE SHEETS (SỬA LỖI TIMEOUT)
+//  */
+// void guiDataLenSheetTask(void *pvParameters) {
+//   bool trangThaiTuMoiNhat = false;
+//   String uidMoiNhat = "N/A";
+
+//   for (;;) {
+//     vTaskDelay(5000 / portTICK_PERIOD_MS);
+
+//     UploadData_t duLieuNhanDuoc;
+//     while (xQueueReceive(uploadQueue, &duLieuNhanDuoc, 0) == pdTRUE) {
+//       trangThaiTuMoiNhat = duLieuNhanDuoc.coDo;
+//       if (String(duLieuNhanDuoc.uid) != "N/A") {
+//         uidMoiNhat = String(duLieuNhanDuoc.uid);
+//       }
+//     }
+
+//     if (WiFi.status() == WL_CONNECTED) {
+//       WiFiClientSecure clientSecure;
+//       HTTPClient http;
+
+//       clientSecure.setInsecure();
+
+//       Serial.println("Tao ket noi moi den Google Scripts (dung HTTPClient)...");
+//       if (http.begin(clientSecure, url)) {
+
+//         http.addHeader("Content-Type", "application/json");
+
+//         // SỬA LỖI: Tăng thời gian chờ lên 10 giây (10000ms)
+//         http.setTimeout(10000);
+
+//         String payload = "{\"command\": \"insert_row\", \"sheet_name\": \"Sheet1\", \"values\": \""
+//                          + String(trangThaiTuMoiNhat ? "Co do" : "Trong") + ","
+//                          + uidMoiNhat + "\"}";
+
+//         Serial.println("--- Dang gui du lieu len Google Sheets ---");
+//         Serial.println(payload);
+
+//         int httpCode = http.POST(payload);
+
+//         if (httpCode > 0) {
+//           Serial.printf("Gui thanh cong, ma HTTP: %d\n", httpCode);
+//           String response = http.getString();
+//           Serial.println("Phan hoi tu server: " + response);
+//         } else {
+//           // Lỗi bây giờ sẽ hiển thị "read Timeout" nếu vẫn xảy ra
+//           Serial.printf("Gui that bai, ma loi: %s\n", http.errorToString(httpCode).c_str());
+//         }
+
+//         http.end();
+//       } else {
+//         Serial.println("Khong the bat dau ket noi HTTP.");
+//       }
+
+//       uidMoiNhat = "N/A";
+
+//     } else {
+//       Serial.println("Loi: Mat ket noi WiFi, khong the gui du lieu.");
+//     }
+//   }
+// }
+
+// // =================== SETUP VÀ LOOP ===================
+
+// // void setup() {
+// //   Serial.begin(115200);
+// //   SPI.begin();
+// //   rfid.PCD_Init();
+// //   delay(1000);
+
+// //   Serial.println("\n--- He thong tu thong minh RTOS (Phien ban co ban) ---");
+
+// //   Serial.printf("Dang ket noi den %s ", ssid);
+// //   WiFi.begin(ssid, password);
+// //   while (WiFi.status() != WL_CONNECTED) {
+// //     delay(500);
+// //     Serial.print(".");
+// //   }
+// //   Serial.println("\nDa ket noi WiFi!");
+
+// //   // SỬA ĐỔI: KHÔNG khởi tạo client ở đây nữa.
+// //   // // --- Khởi tạo HTTPS client ---
+// //   // client = new HTTPSRedirect(httpsPort);
+// //   // client->setInsecure();
+// //   // client->setPrintResponseBody(true);
+// //   // client->setContentTypeHeader("application/json");
+
+// //   uploadQueue = xQueueCreate(10, sizeof(UploadData_t));
+// //   if (uploadQueue == NULL) {
+// //     Serial.println("Loi: Khong the tao Queue!");
+// //     while (1);
+// //   }
+
+// //   xTaskCreate(kiemTraTuTask,       "KiemTraTu",  4096, NULL, 1, NULL);
+// //   xTaskCreate(quanLyCuaVaRFIDTask,  "QuanLyCua",  4096, NULL, 2, NULL);
+// //   xTaskCreate(guiDataLenSheetTask,    "UploadData", 12288, NULL, 1, NULL);
+// // }
+
+// void setup() {
+//   Serial.begin(115200);
+//   SPI.begin();
+//   rfid.PCD_Init();
+//   delay(1000);
+
+//   Serial.println("\n--- He thong tu thong minh RTOS ---");
+
+//   // --- Kết nối WiFi ---
+//   Serial.printf("Dang ket noi den %s ", ssid);
+//   WiFi.begin(ssid, password);
+//   while (WiFi.status() != WL_CONNECTED) {
+//     delay(500);
+//     Serial.print(".");
+//   }
+//   Serial.println("\nDa ket noi WiFi!");
+
+//   // --- SỬA ĐỔI: Đồng bộ thời gian qua NTP ---
+//   // Cấu hình máy chủ thời gian. GMT+7 cho Việt Nam.
+//   configTime(7 * 3600, 0, "pool.ntp.org", "time.asia.apple.com");
+//   Serial.print("Dang dong bo thoi gian he thong");
+
+//   struct tm timeinfo;
+//   while (!getLocalTime(&timeinfo)) {
+//     Serial.print(".");
+//     delay(1000);
+//   }
+//   Serial.println("\nDa dong bo thoi gian xong.");
+//   // --- KẾT THÚC SỬA ĐỔI ---
+
+//   // --- Khởi tạo Queue ---
+//   uploadQueue = xQueueCreate(10, sizeof(UploadData_t));
+//   if (uploadQueue == NULL) {
+//     Serial.println("Loi: Khong the tao Queue!");
+//     while (1);
+//   }
+
+//   // --- Tạo các tác vụ ---
+//   xTaskCreate(kiemTraTuTask,       "KiemTraTu",  4096, NULL, 1, NULL);
+//   xTaskCreate(quanLyCuaVaRFIDTask,  "QuanLyCua",  4096, NULL, 2, NULL);
+//   xTaskCreate(guiDataLenSheetTask,    "UploadData",   12288, NULL, 1, NULL); // Giữ stack cao cho task mạng
+// }
+
+// void loop() {
+//   vTaskDelay(1000 / portTICK_PERIOD_MS);
+// }

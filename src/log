@@ -1,0 +1,7 @@
+Preferences preferences;: cách quản tốt hơn của eeprom
+
+SemaphoreHandle_t preferencesMutex; giúp cho preferences có thể chạy ổn định, tại mỗi thời điểm
+chỉ có 1 tác vụ được truy cập vào preferences
+
+yield(); // Cho phép các tác vụ nền khác chạy
+

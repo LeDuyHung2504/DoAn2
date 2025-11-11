@@ -1,0 +1,1084 @@
+
+#include <Arduino.h>
+#include <Preferences.h>
+#include <WebServer.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <WiFi.h>
+#include <freertos/semphr.h>
+#include <Firebase_ESP_Client.h>
+// sheet
+// #include <HTTPClient.h>
+// #include <WiFiClientSecure.h>
+
+// --- chay cac dich vu can thiet cho firebase ---
+#define FIREBASE_OMIT_FIRESTORE
+#define FIREBASE_OMIT_STORAGE
+#define FIREBASE_OMIT_FUNCTIONS
+#define FIREBASE_OMIT_AUTHENTICATION
+
+// --- RTOS Handle cho Mutex ---
+SemaphoreHandle_t preferencesMutex;
+SemaphoreHandle_t firebaseMutex;
+
+// =================== CẤU HÌNH ===================
+// Thong tin WiFi
+// const char *ssid = "Tenda_3A7FD8";  // Ten WiFi
+// const char *password = "12312345@"; // Mat khau WiFi
+
+// Khai báo đối tượng WebServer ở phạm vi toàn cục
+WebServer server(80);
+
+// ID cua Google Script da deploy
+// const char *GScriptId = "AKfycbxm-3qG1tqFKv0Rlsb07zqPaj__ZBcD-MEFJ7tPNqMXPCWqPZuoLg1rnIjr2RpZDJ2o";
+
+// Id cua Firebase
+#define FIREBASE_HOST "https://test-app-894fd-default-rtdb.firebaseio.com/"
+#define FIREBASE_AUTH "UpCbmq8InF4i5Pbt0wu4wO9gaH5v5LpCfzH7S3oR"
+
+FirebaseConfig config;
+FirebaseAuth auth;
+FirebaseData fbdo;
+
+// --- PIN Definitions ---
+#define ledDo 13            // LED đỏ, báo tủ đang được dùng (có đồ)
+#define ledXanh 12          // LED xanh, báo tủ trống (không có đồ)
+#define khoaDien 26         // Chân điều khiển khóa điện từ
+#define trig 14             // Chân Trig của cảm biến siêu âm
+#define echo 27             // Chân Echo của cảm biến siêu âm
+#define congTacHanhTrinh 15 // Chân nối với công tắc hành trình
+#define SS_PIN 16           // Chân SS/SDA của module RFID
+#define RST_PIN 17          // Chân RST của module RFID
+
+// Doi tuong preferences de luu tru ID nguoi gui qua eeprom
+Preferences preferences;
+// =================== cac nhan cho preferences ===================
+// IdNguoiGui // luu tru ID nguoi gui hien tai
+// ssidWiFi   // luu tru ten wifi
+// passWiFi   // luu tru mat khau wifi
+
+// =================== CÁC ĐỐI TƯỢNG TOÀN CỤC ===================
+MFRC522 rfid(SS_PIN, RST_PIN);
+// String url = "https://script.google.com/macros/s/" + String(GScriptId) + "/exec";
+
+// --- Cấu trúc dữ liệu để giao tiếp giữa các Task ---
+struct UploadData_t
+{
+  bool coDo;    // Trạng thái tủ có đồ hay không
+  char uid[20]; // UID của thẻ RFID, nếu có
+};
+bool trangThaiCua;  // Trạng thái cửa: mở hay đóng
+char uidServer[20]; // UID nhận từ server
+
+// --- Biến toàn cục chứa ID nhận từ server ---
+String IDserver = "";
+// FirebaseData stream;                           // Đối tượng để quản lý luồng stream
+String streamPath = "/TestTrangWeb/currentID"; // Đường dẫn stream trên Firebase
+
+// --- RTOS Handle cho Queue ---
+QueueHandle_t uploadQueue;         // Queue từ Task 1 -> Task 3 (chứa dữ liệu hoàn chỉnh)
+QueueHandle_t triggerQueue;        // Queue từ Task 2 -> Task 1 (chứa UID)
+QueueHandle_t statusFeedbackQueue; // Task 1 -> Task 2 (phản hồi)
+QueueHandle_t requestServerQueue;  // Task 3 -> Task 2 (yêu cầu thêm, xoa ID hien tai va trong eeprom)
+QueueHandle_t stateDoorQueue;      // Task 2 -> Task 3 (trang thai cua)
+
+// --- HÀM XỬ LÝ CHO WEB SERVER ---
+
+/**
+ * @brief Gửi trang HTML cho người dùng nhập WiFi
+ */
+void handleRoot()
+{
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WiFi Setup</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body>
+    <form action="/save" method="POST">
+        <h1>Nhập thông tin WiFi</h1>
+        <p>Tên WiFi (SSID):</p>
+        <input type="text" name="ssid">
+        <p>Mật khẩu:</p>
+        <input type="password" name="pass">
+        <br><br>
+        <input type="submit" value="Connect">
+    </form>
+</body>
+</html>
+)rawliteral";
+  server.send(200, "text/html", html);
+}
+
+/**
+ * @brief Nhận thông tin từ form, lưu và khởi động lại
+ */
+void handleSave()
+{
+  String ssid = server.arg("ssid");
+  String pass = server.arg("pass");
+
+  if (ssid.length() > 0)
+  {
+    Serial.println("Đã nhận thông tin WiFi mới:");
+    Serial.println("SSID: " + ssid);
+
+    // Lưu vào Preferences
+    // Chờ để lấy quyền truy cập
+    if (xSemaphoreTake(preferencesMutex, portMAX_DELAY) == pdTRUE)
+    {
+      // --- BẮT ĐẦU VÙNG AN TOÀN ---
+      Serial.println("Task 0 đã chiếm quyền, đang ghi...");
+
+      preferences.begin("cauHinhWifi", false);
+      preferences.putString("ssid", ssid);
+      preferences.putString("password", pass);
+      preferences.end();
+
+      Serial.println("Task 0 ghi xong, trả lại quyền.");
+      // Trả lại quyền truy cập cho các task khác
+      xSemaphoreGive(preferencesMutex);
+      // --- KẾT THÚC VÙNG AN TOÀN ---
+    }
+
+    // 1. Cho NVS một chút thời gian để hoàn tất việc ghi vào flash.
+    delay(100);
+
+    // 2. Gửi phản hồi về trình duyệt
+    String html = "<h1>Lưu thành công!</h1><p>ESP32 sẽ khởi động lại và thử kết nối với mạng WiFi mới trong 3 giây.</p>";
+    server.send(200, "text/html", html);
+
+    // 3. Tạo một khoảng trễ "thông minh" thay vì delay() cứng
+    //    Trong lúc chờ, vẫn xử lý các yêu cầu web để đảm bảo phản hồi được gửi đi hết.
+    unsigned long startTime = millis();
+    while (millis() - startTime < 3000)
+    {
+      server.handleClient();
+      yield(); // Cho phép các tác vụ nền khác chạy
+    }
+
+    Serial.println("Đang khởi động lại...");
+    ESP.restart(); // Khởi động lại ESP32
+  }
+  else
+  {
+    server.send(400, "text/plain", "Bad Request: SSID không được để trống.");
+  }
+}
+
+/**
+ * @brief Chứa logic khởi động Access Point và Web Server để cấu hình
+ */
+void startConfigurationMode()
+{
+  Serial.println("Chuyen dang Access Point cau hinh.");
+
+  // Chuyển sang chế độ AP
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("ESP32-CauHinh", "12345678");
+
+  Serial.print("AP IP address: ");
+  Serial.println(WiFi.softAPIP());
+
+  // Cài đặt các trang cho web server
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.begin();
+
+  Serial.println("Web server da khoi don, WiFi 'ESP32-CauHinh'.");
+
+  // Vòng lặp chính để xử lý các yêu cầu từ web server
+  // Task này sẽ bị "kẹt" ở đây cho đến khi ESP32 được khởi động lại
+  while (true)
+  {
+    server.handleClient();
+    vTaskDelay(1 / portTICK_PERIOD_MS);
+  }
+}
+
+// =================== CÁC TÁC VỤ (TASKS) ===================
+
+/**
+ * @brief TASK 0: Ket noi WiFi
+ * - Ket noi WiFi khi khoi dong
+ * - tao web server nhap ssid va mat khau neu chua co
+ */
+void ketNoiWiFiTask(void *pvParameters)
+{
+
+  String ssid_from_prefs = "";
+  String pass_from_prefs = "";
+  // Chờ để lấy quyền truy cập
+  if (xSemaphoreTake(preferencesMutex, portMAX_DELAY) == pdTRUE)
+  {
+    // --- BẮT ĐẦU VÙNG AN TOÀN ---
+    Serial.println("Task 0 đã chiếm quyền, đang đọc...");
+
+    preferences.begin("cauHinhWifi", true);
+    ssid_from_prefs = preferences.getString("ssid", "");
+    pass_from_prefs = preferences.getString("password", "");
+    preferences.end();
+
+    Serial.println("Task 0 đọc xong, trả lại quyền.");
+    // Trả lại quyền truy cập cho các task khác
+    xSemaphoreGive(preferencesMutex);
+    // --- KẾT THÚC VÙNG AN TOÀN ---
+  }
+
+  // Kiểm tra xem có lấy được dữ liệu không
+  if (ssid_from_prefs.length() > 0)
+  {
+    Serial.println("Da lay thong tin Wifi, dang ket noi...");
+    Serial.println("SSID: " + ssid_from_prefs);
+
+    //  Dùng .c_str() để "ép kiểu" từ String sang const char* cho hàm WiFi.begin().
+    WiFi.begin(ssid_from_prefs.c_str(), pass_from_prefs.c_str());
+
+    digitalWrite(ledDo, LOW); // tat den do
+    // Chờ kết nối
+    int timeout = 20; // Chờ 5 giây
+    while (WiFi.status() != WL_CONNECTED && timeout > 0)
+    {
+      vTaskDelay(250 / portTICK_PERIOD_MS);
+      Serial.print(".");
+      digitalWrite(ledXanh, !digitalRead(ledXanh)); // tat den xanh
+      timeout--;
+    }
+    // ket noi thanh cong, bat den xanh
+    digitalWrite(ledXanh, HIGH); // bat den xanh
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      Serial.println("\nKet noi thanh cong!");
+      Serial.print("IP: ");
+      Serial.println(WiFi.localIP());
+
+      // --- cap nhat thoi gian qua NTP ---
+      configTime(7 * 3600, 0, "pool.ntp.org", "time.asia.apple.com");
+      Serial.print("Dang dong bo thoi gian he thong");
+      struct tm timeinfo;
+      while (!getLocalTime(&timeinfo))
+      {
+        Serial.print(".");
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+      }
+      Serial.println("\nDa dong bo thoi gian xong.");
+
+      // // Xóa task này đi vì nó đã hoàn thành nhiệm vụ
+      // vTaskDelete(NULL);
+    }
+    else
+    {
+      Serial.println("\nKet noi that bai!");
+
+      startConfigurationMode();
+    }
+  }
+  else
+  {
+    // Nếu không có thông tin WiFi trong Preferences
+    Serial.println("Không có thông tin WiFi được lưu.");
+    // Gọi hàm riêng để khởi động chế độ cấu hình
+    startConfigurationMode();
+  }
+
+  // kiem tra trang thai ket noi wifi lien tuc
+  for (;;)
+  {
+    if (WiFi.status() != WL_CONNECTED)
+    {
+      Serial.println("Mat ket noi WiFi, dang thu ket noi lai...");
+      WiFi.disconnect();
+      WiFi.reconnect();
+      static bool ledXanhState = digitalRead(ledXanh);
+      static bool ledDoState = digitalRead(ledDo);
+      digitalWrite(ledDo, LOW); // tat den do
+      int timeout = 20;         // Chờ 10 giây
+      while (WiFi.status() != WL_CONNECTED && timeout > 0)
+      {
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+        digitalWrite(ledXanh, !digitalRead(ledXanh)); // thong bao ket noi lai wifi
+        Serial.print(".");
+        timeout--;
+      }
+      // ket noi thanh cong, tra ve trang thai den
+      digitalWrite(ledXanh, ledXanhState); // tra ve trang thai den xanh
+      digitalWrite(ledDo, ledDoState);     // tra ve trang thai den do
+
+      if (WiFi.status() == WL_CONNECTED)
+      {
+        Serial.println("\nKet noi lai thanh cong!");
+        Serial.print("IP: ");
+        Serial.println(WiFi.localIP());
+      }
+      else
+      {
+        Serial.println("\nKet noi lai that bai!");
+        static bool ledXanhState = digitalRead(ledXanh);
+        static bool ledDoState = digitalRead(ledDo);
+        digitalWrite(ledDo, LOW);    // tat den do
+        digitalWrite(ledXanh, HIGH); // thong bao ket noi lai wifi
+        // chuyen sang che do cau hinh
+        startConfigurationMode();
+
+        // tra ve trang thai den
+        digitalWrite(ledXanh, ledXanhState); // tra ve trang thai den xanh
+        digitalWrite(ledDo, ledDoState);     // tra ve trang thai den do
+      }
+    }
+    vTaskDelay(5000 / portTICK_PERIOD_MS); // Kiem tra moi 5 giay
+  }
+}
+
+/**
+ * @brief TASK 1: chỉ kiểm tra mỗi khi tủ hoàn thành một quá trình mỏ ra đóng lại
+ * - Đo khoảng cách bằng cảm biến siêu âm.
+ * - Nếu có đồ, bật đèn đỏ và gửi trạng thái vào Queue.
+ * - đồng thời phản hồi tại task 2, để xóa (nếu người dùng đã lấy hết đồ) hoặc lưu ID (nến người dùng vẫn còn đồ trong tủ)
+ */
+void kiemTraTuTask(void *pvParameters)
+{
+  pinMode(trig, OUTPUT);
+  pinMode(echo, INPUT);
+  pinMode(ledDo, OUTPUT);
+  pinMode(ledXanh, OUTPUT);
+
+  char receivedUid[20]; // Buffer để nhận UID từ Task 2
+
+  for (;;)
+  {
+    // cho ket noi wifi
+    while (WiFi.status() != WL_CONNECTED)
+    {
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+
+    if (xQueueReceive(triggerQueue, &receivedUid, portMAX_DELAY) == pdTRUE)
+    {
+      Serial.printf("[Task 1] Nhan duoc UID [%s] tu Task 2, bat dau kiem tra...\n", receivedUid);
+
+      // Phat song xung sieu am
+      digitalWrite(trig, LOW);
+      delayMicroseconds(2);
+      digitalWrite(trig, HIGH);
+      delayMicroseconds(10);
+      digitalWrite(trig, LOW);
+
+      // Doc thoi gian phan hoi va tinh khoang cach
+      long duration = pulseIn(echo, HIGH, 25000);
+      float distance = duration * 0.034 / 2;
+
+      // Chuẩn bị gói dữ liệu hoàn chỉnh
+      UploadData_t duLieuHoanChinh;
+      strcpy(duLieuHoanChinh.uid, receivedUid); // Lấy UID từ Task 2
+
+      // Kiem tra khoang cach de xac dinh co do hay khong
+      if (distance > 0 && distance < 16)
+      {
+        digitalWrite(ledDo, HIGH);
+        digitalWrite(ledXanh, LOW);
+        duLieuHoanChinh.coDo = true; // Gán trạng thái có đồ
+      }
+      else
+      {
+        digitalWrite(ledDo, LOW);
+        digitalWrite(ledXanh, HIGH);
+        duLieuHoanChinh.coDo = false; // Gán trạng thái trống
+      }
+      if (duLieuHoanChinh.coDo == true)
+      {
+        Serial.println("[Task 1] Kiem tra xong: Tu CO DO.");
+        // Gửi gói dữ liệu hoàn chỉnh cho Task 3
+        Serial.printf("[Task 1] Gui cho Task 3: Trang thai [%s], UID [%s]\n",
+                      duLieuHoanChinh.coDo ? "Co do" : "Trong",
+                      duLieuHoanChinh.uid);
+        xQueueSend(uploadQueue, &duLieuHoanChinh, 0);
+      }
+      else
+      {
+        Serial.println("[Task 1] Kiem tra xong: Tu TRONG.");
+        strcpy(duLieuHoanChinh.uid, "N/A"); // Đặt UID rỗng nếu tủ trống
+        // Gửi gói dữ liệu hoàn chỉnh cho Task 3
+        Serial.printf("[Task 1] Gui cho Task 3: Trang thai [%s], UID [%s]\n",
+                      duLieuHoanChinh.coDo ? "Co do" : "Trong",
+                      duLieuHoanChinh.uid);
+        xQueueSend(uploadQueue, &duLieuHoanChinh, 0);
+      }
+
+      // Gửi phản hồi trạng thái (bool) về cho Task 2
+      Serial.printf("[Task 1] Gui phan hoi cho Task 2: coDo = %s\n", duLieuHoanChinh.coDo ? "true" : "false");
+      xQueueSend(statusFeedbackQueue, &duLieuHoanChinh.coDo, 0);
+    }
+  }
+}
+
+/**
+ * @brief TASK 2: QUẢN LÝ CỬA VÀ RFID
+ * - Đọc công tắc hành trình để biết cửa đóng hay mở.
+ * - Nếu cửa đóng, cho phép quét thẻ RFID để mở khóa.
+ * - Sau khi người dùng gửi đồ xong, gửi UID vào Queue, đánh thức task 1 kiểm tra trạng thái tủ
+ * nếu tủ không có đồ, ID sẽ được xóa, nếu tủ có đồ, ID sẽ được lưu lại để so sánh khi lấy đồ
+ */
+
+// ham con cua task 2: no nhan ID tu server qua stream, kiem tra xem ID do:
+// 1. trung voi ID hien tai -> giu nguyen tat ca trang thai
+// 2. ID duoc thay doi -> thay the IdNguoiGuiTruoc, id trong eeprom
+// 3. ID rong -> xoa tat ca ID
+// chi khi dong tu ID moi duoc chap nhan chinh sua
+// String phanHoiServer(String IDserver)
+// {
+//   String IdNguoiGuiTruoc; // bien cuc bo trong ham (tuong tu trong ham chinh)
+
+//   Serial.printf("[Task 2] Nhan yeu cau tu Stream Firebase: [%s]\n", IDserver.c_str());
+//   // // semaphore cho firebase
+//   // if (xSemaphoreTake(firebaseMutex, portMAX_DELAY) == pdTRUE)
+//   // {
+//   //   // --- BẮT ĐẦU VÙNG AN TOÀN ---
+//   //   Serial.println("Task 1 đã chiếm quyền bien uidServer, dang ghi...");
+//   //   Serial.println("Task 1 doc xong, trả lại quyền.");
+//   //   // Trả lại quyền truy cập cho các task khác
+//   //   xSemaphoreGive(firebaseMutex);
+//   //   // --- KẾT THÚC VÙNG AN TOÀN ---
+//   // }
+
+//   if (IDserver == "")
+//   {
+//     Serial.println("[Task 2] Yeu cau xoa ID hien tai.");
+//     IdNguoiGuiTruoc = "";
+//     // Xóa ID trong EEPROM
+//     // Chờ để lấy quyền truy cập
+//     if (xSemaphoreTake(preferencesMutex, portMAX_DELAY) == pdTRUE)
+//     {
+//       // Xóa ID trong EEPROM
+//       preferences.begin("tuThongMinh", false);
+//       preferences.remove("IdNguoiGui");
+//       preferences.end();
+//       Serial.println("Xoa ID nguoi gui trong EEPROM thanh cong.");
+//       xSemaphoreGive(preferencesMutex);
+//     }
+//   }
+//   else
+//   {
+//     Serial.printf("[Task 2] Yeu cau them ID moi: [%s]\n", IDserver.c_str());
+//     IdNguoiGuiTruoc = IDserver;
+//     // Lưu ID mới vào EEPROM
+//     // Chờ để lấy quyền truy cập
+//     if (xSemaphoreTake(preferencesMutex, portMAX_DELAY) == pdTRUE)
+//     {
+//       // Lưu ID vào EEPROM
+//       preferences.begin("tuThongMinh", false);
+//       preferences.putString("IdNguoiGui", IDserver);
+//       preferences.end();
+//       Serial.println("Luu ID nguoi gui: " + IDserver + " duoc cai dat tu server");
+//     }
+//   }
+//   return IdNguoiGuiTruoc;
+// } // Xu ly sự kiện cập nhật, xóa ID từ server
+
+void quanLyCuaVaRFIDTask(void *pvParameters)
+{
+  pinMode(khoaDien, OUTPUT);
+  pinMode(congTacHanhTrinh, INPUT_PULLDOWN);
+  // String uidStr = ""; // Biến để lưu UID thẻ hiện tại
+  static bool daKhoiTaoEEPROM = false; // Biến tĩnh để theo dõi trạng thái khởi tạo EEPROM
+  static String IDserver;
+  static String IdNguoiGuiTruoc = ""; // Biến tĩnh để lưu ID người gửi trước đó
+  digitalWrite(khoaDien, LOW);        // Mặc định khóa tủ khi khởi động
+  bool capNhatTrangThaiCua = true;    // giup cho ham nay chi chay mot lan khi dieu kien cua dong/ mo bi lap lai lien tuc
+  String savedId = "";
+
+  for (;;)
+  {
+    // Kiem tra ket noi wifi
+    if (WiFi.status() != WL_CONNECTED)
+    {
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
+      continue;
+    }
+    // ---- KHỐI LỆNH CHẠY MỘT LẦN ----
+    // Kiểm tra xem đã khởi tạo chưa
+    if (!daKhoiTaoEEPROM)
+    {
+      Serial.println("bat dau kiem tra EEPROM...");
+
+      String savedId = "";
+
+      // Đoạn mã kiểm tra EEPROM của bạn
+      if (xSemaphoreTake(preferencesMutex, portMAX_DELAY) == pdTRUE)
+      {
+        preferences.begin("tuThongMinh", true); // Mở Preferences ở chế độ read-only
+        savedId = preferences.getString("IdNguoiGui", "");
+        preferences.end();
+        xSemaphoreGive(preferencesMutex);
+      }
+
+      if (savedId != "")
+      {
+        Serial.printf("Phat hien ID nguoi gui luu trong EEPROM: %s\n", savedId.c_str());
+        IdNguoiGuiTruoc = savedId;
+        digitalWrite(ledXanh, LOW);
+        digitalWrite(ledDo, HIGH);
+        Serial.println("Phat hien tu bi tat dot ngot, khi dang duoc su dung");
+      }
+      else
+      {
+        Serial.println("[Init] Khong tim thay ID nguoi gui trong EEPROM.");
+        digitalWrite(ledXanh, HIGH);
+        digitalWrite(ledDo, LOW);
+      }
+
+      // Đánh dấu là đã chạy xong, bien nay nham giu cho vong nay chi chay lan dau tien khi chuong trinh khoi tao
+      daKhoiTaoEEPROM = true;
+      Serial.println("[Init] Da kiem tra EEPROM xong. Se khong chay lai nua.");
+    }
+    // ---- KẾT THÚC KHỐI LỆNH CHẠY MỘT LẦN ----
+
+    // do thời gian đóng cửa nhiều hơn nên đóng cửa sẽ đặt mức LOW tránh nhiễu
+    // Đọc trạng thái cửa. LOW là cửa đóng, HIGH là cửa mở.
+    trangThaiCua = digitalRead(congTacHanhTrinh);
+    if (trangThaiCua == LOW)
+    {
+
+      // Xu ly sự kiện cập nhật, xóa ID từ server
+      if (xQueueReceive(requestServerQueue, &uidServer, 0) == pdTRUE)
+      {
+        IDserver = String(uidServer);
+        if (IDserver != IdNguoiGuiTruoc)
+        {
+          if (IDserver != "N/A")
+          {
+            IdNguoiGuiTruoc = IDserver;
+            // ghi IDserver vao EEPROM
+            if (xSemaphoreTake(preferencesMutex, portMAX_DELAY) == pdTRUE)
+            {
+              // Lưu ID vào EEPROM
+              preferences.begin("tuThongMinh", false);
+              preferences.putString("IdNguoiGui", IDserver);
+              preferences.end();
+              Serial.println("Luu ID nguoi gui: " + IdNguoiGuiTruoc + " duoc cai dat tu server");
+            }
+          }
+          else
+          {
+            IdNguoiGuiTruoc = "";
+            // ghi IDserver vao EEPROM
+            if (xSemaphoreTake(preferencesMutex, portMAX_DELAY) == pdTRUE)
+            {
+              // Lưu ID vào EEPROM
+              preferences.begin("tuThongMinh", false);
+              preferences.putString("IdNguoiGui", "");
+              preferences.end();
+              Serial.println("Xoa ID");
+            }
+          }
+        }
+      }
+
+      if (capNhatTrangThaiCua == true)
+      {
+        Serial.println("Cua dang dong.");
+        // gui trang thai cua cho task 3
+        xQueueSend(stateDoorQueue, &trangThaiCua, 100);
+        capNhatTrangThaiCua = false;
+      }
+
+      // Mức 0 -> Cửa đang đóng
+      // Trường hợp GỬI ĐỒ (tủ đang trống)
+      if ((IdNguoiGuiTruoc == "") && rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial())
+      {
+        Serial.printf("chua co ID, ");
+        Serial.println("Da quet the gui do, mo khoa...");
+        digitalWrite(khoaDien, HIGH);
+
+        while (digitalRead(congTacHanhTrinh) == LOW)
+        {
+          vTaskDelay(50 / portTICK_PERIOD_MS);
+        }
+        Serial.println("Phat hien nguoi dung da mo cua.");
+        digitalWrite(khoaDien, LOW);
+        // Cập nhật trạng thái cửa
+        trangThaiCua = true;                          // Cửa đã được mở
+        xQueueSend(stateDoorQueue, &trangThaiCua, 0); // Gửi trạng thái cửa cho Task 3
+        vTaskDelay(200 / portTICK_PERIOD_MS);         // Cho Queue có thời gian xử lý
+
+        Serial.println("Dang cho nguoi dung dong cua...");
+        while (digitalRead(congTacHanhTrinh) == HIGH)
+        {
+          vTaskDelay(50 / portTICK_PERIOD_MS);
+        }
+        Serial.println("Phat hien nguoi dung da dong cua. Hoan thanh gui do.");
+        // Cập nhật trạng thái cửa
+        trangThaiCua = false;                         // Cửa đã được đóng
+        xQueueSend(stateDoorQueue, &trangThaiCua, 0); // Gửi trạng thái cửa cho Task 3
+        vTaskDelay(200 / portTICK_PERIOD_MS);         // Cho Queue có thời gian xử lý
+
+        // Lưu UID người gửi
+        String uidStr = "";
+        for (byte i = 0; i < rfid.uid.size; i++)
+        {
+          uidStr += String(rfid.uid.uidByte[i], HEX);
+        }
+        uidStr.toUpperCase();
+        IdNguoiGuiTruoc = uidStr;
+
+        // Gửi UID vào Queue kích hoạt Task 1 kiểm tra trạng thái tủ
+        char uid_buffer[20];
+        uidStr.toCharArray(uid_buffer, sizeof(uid_buffer));
+        xQueueSend(triggerQueue, &uid_buffer, 0);
+        Serial.println("Đánh thức task 1");
+
+        // Chờ phản hồi (bool) từ Task 1
+        bool tuCoDo;
+        // Chờ tối đa 5 giây, nếu Task 1 không phản hồi thì có lỗi
+        if (xQueueReceive(statusFeedbackQueue, &tuCoDo, pdMS_TO_TICKS(5000)) == pdTRUE)
+        {
+          if (tuCoDo == false)
+          {
+            // Nếu Task 1 báo tủ TRỐNG
+            Serial.println("[Task 2] Phan hoi: Tu trong. Xoa ID nguoi gui.");
+            IdNguoiGuiTruoc = ""; // Xóa ID
+          }
+          else
+          {
+            // Nếu Task 1 báo CÓ ĐỒ
+            Serial.println("[Task 2] Phan hoi: Co do. Luu ID nguoi gui.");
+
+            // Chờ để lấy quyền truy cập
+            if (xSemaphoreTake(preferencesMutex, portMAX_DELAY) == pdTRUE)
+            {
+              // --- BẮT ĐẦU VÙNG AN TOÀN ---
+              Serial.println("Task 2 đã chiếm quyền, đang ghi...");
+
+              // Lưu ID vào EEPROM
+              preferences.begin("tuThongMinh", false);
+              preferences.putString("IdNguoiGui", uidStr);
+              preferences.end();
+              Serial.println("Luu ID nguoi gui: " + uidStr);
+
+              Serial.println("Task 2 ghi xong, trả lại quyền.");
+              // Trả lại quyền truy cập cho các task khác
+              xSemaphoreGive(preferencesMutex);
+              // --- KẾT THÚC VÙNG AN TOÀN ---
+            }
+          }
+        }
+        else
+        {
+          Serial.println("[Task 2] Loi: Khong nhan duoc phan hoi tu Task 1!");
+          // Xử lý lỗi ( xóa ID cho an toàn)
+          IdNguoiGuiTruoc = "";
+          // Chờ để lấy quyền truy cập
+          if (xSemaphoreTake(preferencesMutex, portMAX_DELAY) == pdTRUE)
+          {
+            // --- BẮT ĐẦU VÙNG AN TOÀN ---
+            Serial.println("Task A đã chiếm quyền, đang ghi...");
+
+            preferences.begin("tuThongMinh", false);
+            preferences.putString("IdNguoiGui", ""); // Xóa ID trong EEPROM
+            preferences.end();
+
+            Serial.println("Task A ghi xong, trả lại quyền.");
+            // Trả lại quyền truy cập cho các task khác
+            xSemaphoreGive(preferencesMutex);
+            // --- KẾT THÚC VÙNG AN TOÀN ---
+          }
+        }
+
+        // Xóa UID trong bộ đọc để chuẩn bị cho lần quét tiếp theo
+        rfid.PICC_HaltA();
+        rfid.PCD_StopCrypto1();
+        // Xóa biến uidStr để lần sau quét thẻ mới không bị dính UID cũ
+        uidStr = "";
+      }
+
+      // Trường hợp LẤY ĐỒ (tủ đang có đồ)
+      else if ((IdNguoiGuiTruoc != "") && rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial())
+      {
+        Serial.printf("da co ID: %s\n", IdNguoiGuiTruoc.c_str());
+        // Xây dựng chuỗi UID một lần để so sánh
+        String currentUidStr = "";
+        for (byte i = 0; i < rfid.uid.size; i++)
+        {
+          currentUidStr += String(rfid.uid.uidByte[i], HEX);
+        }
+        currentUidStr.toUpperCase();
+
+        if (currentUidStr == IdNguoiGuiTruoc)
+        {
+          Serial.println("The RFID hop le. Mo khoa de lay do...");
+          // Mở khóa
+          digitalWrite(khoaDien, HIGH);
+
+          while (digitalRead(congTacHanhTrinh) == LOW)
+          {
+            vTaskDelay(50 / portTICK_PERIOD_MS);
+          }
+          Serial.println("Phat hien nguoi dung da mo cua de lay do.");
+          digitalWrite(khoaDien, LOW);
+          // Cập nhật trạng thái cửa
+          trangThaiCua = true;                          // Cửa đã được mở
+          xQueueSend(stateDoorQueue, &trangThaiCua, 0); // Gửi trạng thái cửa cho Task 3
+          vTaskDelay(200 / portTICK_PERIOD_MS);         // Cho Queue có thời gian xử lý
+
+          Serial.println("Dang cho nguoi dung dong cua sau khi lay do...");
+          while (digitalRead(congTacHanhTrinh) == HIGH)
+          {
+            vTaskDelay(50 / portTICK_PERIOD_MS);
+          }
+          Serial.println("Phat hien nguoi dung da dong cua. Hoan thanh lay do.");
+          // Cập nhật trạng thái cửa
+          trangThaiCua = false;                         // Cửa đã được đóng
+          xQueueSend(stateDoorQueue, &trangThaiCua, 0); // Gửi trạng thái cửa cho Task 3
+          vTaskDelay(200 / portTICK_PERIOD_MS);         // Cho Queue có thời gian xử lý
+
+          // Kích hoạt task kiểm tra tủ sau khi đóng cửa
+          Serial.println("Đánh thức task 1");
+          char uid_buffer[20];
+          currentUidStr.toCharArray(uid_buffer, sizeof(uid_buffer));
+
+          Serial.println("[Task 2] Gui lenh " + currentUidStr + " cho Task 1.");
+          xQueueSend(triggerQueue, &uid_buffer, 0);
+
+          // Chờ phản hồi (bool) từ Task 1
+          bool tuCoDo;
+          // Chờ tối đa 5 giây, nếu Task 1 không phản hồi thì có lỗi
+          if (xQueueReceive(statusFeedbackQueue, &tuCoDo, pdMS_TO_TICKS(5000)) == pdTRUE)
+          {
+            if (tuCoDo == false)
+            {
+              // Nếu Task 1 báo tủ TRỐNG
+              Serial.println("[Task 2] Phan hoi: Tu trong. Xoa ID nguoi gui.");
+              IdNguoiGuiTruoc = ""; // Xóa ID
+              preferences.begin("tuThongMinh", false);
+              preferences.putString("IdNguoiGui", ""); // Xóa ID trong EEPROM
+              preferences.end();
+            }
+            else
+            {
+              // Nếu Task 1 báo vẫn CÓ ĐỒ
+              Serial.println("[Task 2] Phan hoi: Van con do. Giu lai ID nguoi gui.");
+              // Không làm gì cả, giữ nguyên IdNguoiGuiTruoc
+            }
+          }
+          else
+          {
+            Serial.println("[Task 2] Loi: Khong nhan duoc phan hoi tu Task 1!");
+            // Xử lý lỗi (ví dụ: mặc định là xóa ID cho an toàn)
+            IdNguoiGuiTruoc = "";
+
+            // Chờ để lấy quyền truy cập
+            if (xSemaphoreTake(preferencesMutex, portMAX_DELAY) == pdTRUE)
+            {
+              // --- BẮT ĐẦU VÙNG AN TOÀN ---
+              Serial.println("Task 2 đã chiếm quyền, đang xoa...");
+
+              preferences.begin("tuThongMinh", false);
+              preferences.putString("IdNguoiGui", ""); // Xóa ID trong EEPROM
+              preferences.end();
+
+              Serial.println("Task A xoa xong, trả lại quyền.");
+              // Trả lại quyền truy cập cho các task khác
+              xSemaphoreGive(preferencesMutex);
+              // --- KẾT THÚC VÙNG AN TOÀN ---
+            }
+          }
+        }
+        else
+        {
+          Serial.println("The RFID khong hop le.");
+        }
+        rfid.PICC_HaltA();
+        rfid.PCD_StopCrypto1();
+      }
+    }
+    else
+    { // Mức 1 -> Cửa đang mở
+      digitalWrite(khoaDien, LOW);
+      if (capNhatTrangThaiCua == false)
+      {
+        Serial.println("Cua dang mo.");
+        // gui trang thai cua cho task 3
+        xQueueSend(stateDoorQueue, &trangThaiCua, 0);
+        capNhatTrangThaiCua = true;
+      }
+    }
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+  }
+}
+
+/**
+ * @brief TASK 3: XỬ LÝ GIAO TIẾP FIREBASE (PHIÊN BẢN STREAM HOÀN CHỈNH)
+ * - Gửi dữ liệu (trạng thái cửa, trạng thái tủ, UID) lên Firebase khi nhận từ Queue.
+ * - Duy trì kết nối Stream để nhận lệnh cập nhật/xóa UID real-time (thông qua callback).
+ */
+
+/**
+ * @brief TASK 3: GỬI DỮ LIỆU LÊN GOOGLE SHEETS
+ * task này sẽ ngủ đến khi có dữ liệu mới trong queue (kiểu hướng sự kiện)
+ */
+void guiNhanFirebaseGooleSheetTask(void *pvParameters)
+{
+  // lấy thời gian hệ thống, sau mỗi 30s kiểm tra currentID trên firebase một lần
+  // nếu nó là một string "", nghĩa là xóa ID
+  time_t now = time(nullptr);    // Lấy thời gian hiện tại, biến cục bộ, giải phóng ngay sau khi hàm kết thúc
+  time_t mocThoiGian = now + 30; // Mốc 5 giây sau thời điểm hiện tại
+
+  // biến nhận dữ liệu từ queue
+  UploadData_t duLieuNhanDuoc;
+  bool trangThaiCuaNhanDuoc;
+
+  for (;;)
+  {
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      // ================== KIỂM TRA VÀ GỬI DỮ LIỆU LÊN FIREBASE ==================
+      // Cho den khi co du lieu trong stateDoorQueue
+      if (xQueueReceive(stateDoorQueue, &trangThaiCuaNhanDuoc, 0) == pdTRUE)
+      {
+        // co du lieu trong stateDoorQueue
+        Serial.printf("[Task 3] Nhan duoc trang thai cua: %s\n", trangThaiCuaNhanDuoc ? "Mo" : "Dong");
+        // Gui len Firebase
+        Serial.println("--- Dang gui trang thai cua len Firebase ---");
+        // gui du lieu
+        Firebase.RTDB.setString(&fbdo, "/TestTrangWeb/lockStatus", String(trangThaiCuaNhanDuoc ? "Mo" : "Dong"));
+        Serial.println("Du lieu gui len: trang thai cua: " + String(trangThaiCuaNhanDuoc ? "Mo" : "Dong"));
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+      }
+
+      // Cho den khi co du lieu trong uploadQueue
+      if (xQueueReceive(uploadQueue, &duLieuNhanDuoc, 0) == pdTRUE)
+      {
+        // co du lieu trong uploadQueue
+        // Gui len Firebase
+        Serial.println("--- Dang gui du lieu len Firebase ---");
+        // gui du lieu
+        Firebase.RTDB.setString(&fbdo, "/TestTrangWeb/itemStatus", String(duLieuNhanDuoc.coDo ? "Co do" : "Trong"));
+        Firebase.RTDB.setString(&fbdo, "/TestTrangWeb/currentID", String(duLieuNhanDuoc.uid));
+        Serial.println("Du lieu gui len: trang thai: " + String(duLieuNhanDuoc.coDo ? "Co do" : "Trong") + ", UID: " + String(duLieuNhanDuoc.uid));
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+      }
+
+      // ================== NHẬN LỆNH TỪ FIREBASE (POLLING MỖI 30 GIÂY) ==================
+
+      // SỬA LỖI: Lấy thời gian 'now' bên trong vòng lặp
+      time_t now = time(nullptr);
+      if (now > mocThoiGian)
+      {
+        Serial.println("[Task 3] Da den moc 30s, kiem tra currentID tren Firebase...");
+
+        String currentIDFirebase = "";
+        if (Firebase.RTDB.getString(&fbdo, "/TestTrangWeb/currentID"))
+        {
+          currentIDFirebase = fbdo.stringData();
+          Serial.println("currentID tren Firebase: " + currentIDFirebase);
+        }
+        else
+        {
+          Serial.printf("Loi khi doc Firebase: %s\n", fbdo.errorReason().c_str());
+        }
+
+        // Lấy ID từ EEPROM để so sánh
+        String IdHienTaiTrongTu = "";
+        if (xSemaphoreTake(preferencesMutex, pdMS_TO_TICKS(1000)) == pdTRUE)
+        {
+          preferences.begin("tuThongMinh", true);
+          IdHienTaiTrongTu = preferences.getString("IdNguoiGui", "");
+          preferences.end();
+          xSemaphoreGive(preferencesMutex);
+        }
+        Serial.println("currentID trong EEPROM: " + IdHienTaiTrongTu);
+
+        // neu EEPROM trong, ID la N/A
+        if (IdHienTaiTrongTu == "")
+        {
+          IdHienTaiTrongTu = "N/A";
+        }
+
+        // Logic so sánh
+        if (currentIDFirebase != IdHienTaiTrongTu)
+        {
+          Serial.println("[Task 3] Phat hien thay doi! Dong bo ID tu Firebase ve Task 2.");
+          char uid_buffer[20];
+          currentIDFirebase.toCharArray(uid_buffer, sizeof(uid_buffer));
+          xQueueSend(requestServerQueue, &uid_buffer, 0);
+        }
+        else
+        {
+          Serial.println("[Task 3] Khong co gi thay doi, ID da dong bo.");
+        }
+        mocThoiGian = now + 30; // Cập nhật mốc thời gian mới
+      }
+
+      //================== KẾT THÚC KIỂM TRA VÀ GỬI DỮ LIỆU LÊN FIREBASE ==================
+      vTaskDelay(500 / portTICK_PERIOD_MS);
+    }
+    else
+    {
+      Serial.println("Loi: Mat ket noi internet, khong the gui du lieu.");
+      vTaskDelay(5000 / portTICK_PERIOD_MS); // Thu ket noi lai sau 5 giay
+    }
+  }
+}
+// // --- Callback khi có dữ liệu stream ---
+// void streamCallback(FirebaseStream data)
+// {
+//   if (WiFi.status() == WL_CONNECTED)
+//   {
+//     Serial.println("\n--- NHẬN DỮ LIỆU STREAM ---");
+//     Serial.printf("ĐƯỜNG DẪN: %s\n", data.dataPath().c_str());
+//     Serial.printf("SỰ KIỆN: %s\n", data.eventType().c_str());
+
+//     String dataType = data.dataType();
+//     Serial.printf("KIỂU DỮ LIỆU: %s\n", dataType.c_str());
+//     Serial.print("GIÁ TRỊ: ");
+
+//     if (dataType == "string")
+//     {
+//       Serial.println(data.stringData());
+
+//       String newUid = data.stringData();
+//       char uid_buffer[20];
+//       newUid.toCharArray(uid_buffer, sizeof(uid_buffer));
+
+//       if (requestServerQueue != NULL)
+//       {
+//         if (xQueueSend(requestServerQueue, &uid_buffer, 0) != pdPASS)
+//         {
+//           Serial.println("Lỗi: requestServerQueue bị đầy!");
+//         }
+//       }
+//     }
+//     else if (dataType == "null")
+//     {
+//       Serial.println("null (dữ liệu đã bị xóa)");
+//       char empty_buffer[20] = "";
+//       if (requestServerQueue != NULL)
+//       {
+//         xQueueSend(requestServerQueue, &empty_buffer, 0);
+//       }
+//     }
+//     else
+//     {
+//       Serial.println("(Bỏ qua - Không phải kiểu string)");
+//     }
+
+//     Serial.println("--------------------------");
+//   }
+// }
+
+// // --- Callback khi stream timeout ---
+// void streamTimeoutCallback(bool timeout)
+// {
+//   if (timeout)
+//   {
+//     Serial.println("Stream timeout occurred!");
+//   }
+// }
+
+// =================== SETUP VÀ LOOP ===================
+void setup()
+{
+  Serial.begin(115200);
+  SPI.begin();
+  rfid.PCD_Init();
+  delay(1000);
+
+  pinMode(ledDo, OUTPUT);
+  pinMode(ledXanh, OUTPUT);
+
+  Serial.println("\n--- He thong tu thong minh RTOS ---");
+
+  // khoi tao firebase
+  config.host = FIREBASE_HOST;
+  config.signer.tokens.legacy_token = FIREBASE_AUTH;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // // khoi tao stream
+  // Serial.printf("Starting stream on path: %s\n", streamPath.c_str());
+  // if (!Firebase.RTDB.beginStream(&stream, streamPath))
+  // {
+  //   Serial.printf("ERROR starting stream: %s\n", stream.errorReason().c_str());
+  // }
+  // Firebase.RTDB.setStreamCallback(&stream, streamCallback, streamTimeoutCallback);
+
+  // Tạo Mutex
+  preferencesMutex = xSemaphoreCreateMutex();
+  firebaseMutex = xSemaphoreCreateMutex();
+
+  if (preferencesMutex == NULL)
+  {
+    Serial.println("Lỗi: Không thể tạo Mutex!");
+    // Treo ở đây nếu không tạo được
+    while (1)
+      ;
+  }
+
+  // Queue cho Task 1 -> Task 3 (Upload)
+  uploadQueue = xQueueCreate(10, sizeof(UploadData_t));
+  // Queue cho Task 2 -> Task 1 (Sensor)
+  triggerQueue = xQueueCreate(5, sizeof(char[20]));
+  // Queue phản hồi, kích thước 1, kiểu bool, 1 -> 2
+  statusFeedbackQueue = xQueueCreate(1, sizeof(bool));
+  // Queue 2 -> 3 trang thai cua
+  stateDoorQueue = xQueueCreate(1, sizeof(bool));
+  // Queue yeu cau tu Task 3 -> Task 2
+  requestServerQueue = xQueueCreate(5, sizeof(char[20]));
+
+  if (uploadQueue == NULL || triggerQueue == NULL || statusFeedbackQueue == NULL || stateDoorQueue == NULL || requestServerQueue == NULL)
+  {
+    Serial.println("Loi: Khong the tao Queue!");
+    while (1)
+      ;
+  }
+
+  // xTaskCreate(kiemTraTuTask, "KiemTraTu", 4096, NULL, 1, NULL);
+  // xTaskCreate(quanLyCuaVaRFIDTask, "QuanLyCua", 4096, NULL, 2, NULL);
+  // xTaskCreate(guiNhanFirebaseGooleSheetTask, "UploadData", 12288, NULL, 1, NULL);
+  // xTaskCreate(ketNoiWiFiTask, "KetNoiWiFi", 4096, NULL, 3, NULL);
+
+  // Ghim các tác vụ MẠNG (WiFi, Firebase) vào Core 1
+  xTaskCreatePinnedToCore(
+      ketNoiWiFiTask, // Hàm của task
+      "KetNoiWiFi",   // Tên task
+      4096,           // Stack size
+      NULL,           // Tham số
+      3,              // Độ ưu tiên cao nhất (để kết nối WiFi trước)
+      NULL,           // Task handle
+      1);             // Ghim vào Core 1
+
+  xTaskCreatePinnedToCore(
+      guiNhanFirebaseGooleSheetTask, // Hàm của task
+      "FirebaseHandler",             // Tên task
+      12288,                         // Stack size lớn
+      NULL,                          // Tham số
+      1,                             // Độ ưu tiên
+      NULL,                          // Task handle
+      1);                            // Ghim vào Core 1
+
+  // Ghim các tác vụ ỨNG DỤNG (RFID, Cảm biến) vào Core 0
+  xTaskCreatePinnedToCore(
+      quanLyCuaVaRFIDTask, // Hàm của task
+      "QuanLyCua",         // Tên task
+      6144,                // Stack size (nhiều logic)
+      NULL,                // Tham số
+      2,                   // Độ ưu tiên (cao hơn cảm biến)
+      NULL,                // Task handle
+      0);                  // Ghim vào Core 0
+
+  xTaskCreatePinnedToCore(
+      kiemTraTuTask, // Hàm của task
+      "KiemTraTu",   // Tên task
+      4096,          // Stack size
+      NULL,          // Tham số
+      1,             // Độ ưu tiên
+      NULL,          // Task handle
+      0);            // Ghim vào Core 0
+}
+
+void loop()
+{
+  vTaskDelete(NULL); // Tối ưu: Xóa task loop() để giải phóng bộ nhớ
+}

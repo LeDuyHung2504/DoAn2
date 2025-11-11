@@ -1,0 +1,111 @@
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <freertos/FreeRTOS.h> // Nếu dùng Queue
+
+// --- WIFI CONFIG ---
+const char *ssid = "Tenda_3A7FD8";
+const char *password = "12312345@";
+
+// --- Firebase Config ---
+#define FIREBASE_HOST "https://test-app-894fd-default-rtdb.firebaseio.com/"
+#define FIREBASE_AUTH "UpCbmq8InF4i5Pbt0wu4wO9gaH5v5LpCfzH7S3oR"
+
+// --- Firebase Objects ---
+FirebaseConfig config;
+FirebaseAuth auth;
+FirebaseData stream;
+
+// --- Stream Path ---
+String streamPath = "/TestTrangWeb/currentID";
+
+// --- Queue (nếu dùng FreeRTOS Queue) ---
+QueueHandle_t requestServerQueue;
+
+// --- Callback khi có dữ liệu stream ---
+void streamCallback(FirebaseStream data) {
+  Serial.println("\n--- NHẬN DỮ LIỆU STREAM ---");
+  Serial.printf("ĐƯỜNG DẪN: %s\n", data.dataPath().c_str());
+  Serial.printf("SỰ KIỆN: %s\n", data.eventType().c_str());
+
+  String dataType = data.dataType();
+  Serial.printf("KIỂU DỮ LIỆU: %s\n", dataType.c_str());
+  Serial.print("GIÁ TRỊ: ");
+
+  if (dataType == "string") {
+    Serial.println(data.stringData());
+
+    String newUid = data.stringData();
+    char uid_buffer[20];
+    newUid.toCharArray(uid_buffer, sizeof(uid_buffer));
+
+    if (requestServerQueue != NULL) {
+      if (xQueueSend(requestServerQueue, &uid_buffer, 0) != pdPASS) {
+        Serial.println("Lỗi: requestServerQueue bị đầy!");
+      }
+    }
+
+  } else if (dataType == "null") {
+    Serial.println("null (dữ liệu đã bị xóa)");
+    char empty_buffer[20] = "";
+    if (requestServerQueue != NULL) {
+      xQueueSend(requestServerQueue, &empty_buffer, 0);
+    }
+
+  } else {
+    Serial.println("(Bỏ qua - Không phải kiểu string)");
+  }
+
+  Serial.println("--------------------------");
+}
+
+// --- Callback khi stream timeout ---
+void streamTimeoutCallback(bool timeout) {
+  if (timeout) {
+    Serial.println("Stream timeout occurred!");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("\n--- Firebase Stream Test ---");
+
+  WiFi.begin(ssid, password);
+  Serial.printf("Connecting to %s ", ssid);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  config.host = FIREBASE_HOST;
+  config.signer.tokens.legacy_token = FIREBASE_AUTH;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  Serial.printf("Starting stream on path: %s\n", streamPath.c_str());
+  if (!Firebase.RTDB.beginStream(&stream, streamPath)) {
+    Serial.printf("ERROR starting stream: %s\n", stream.errorReason().c_str());
+  }
+
+  Firebase.RTDB.setStreamCallback(&stream, streamCallback, streamTimeoutCallback);
+
+  // Tạo Queue nếu cần
+  requestServerQueue = xQueueCreate(5, sizeof(char[20]));
+
+  Serial.println("Setup complete. Listening for changes...");
+}
+
+void loop() {
+  if (Firebase.ready() && !Firebase.RTDB.readStream(&stream)) {
+    Serial.printf("ERROR reading stream: %s\n", stream.errorReason().c_str());
+    delay(1000);
+  }
+
+  delay(50);
+}
